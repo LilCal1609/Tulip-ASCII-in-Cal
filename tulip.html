@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>3D ASCII Tulip 360° - High Contrast</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-user-select: none; user-select: none; }
+    html, body { width: 100%; height: 100%; background: #000; overflow: hidden; touch-action: none; font-family: monospace; }
+    canvas { display: block; width: 100%; height: 100%; }
+    .hint {
+      position: fixed;
+      top: 14px;
+      width: 100%;
+      text-align: center;
+      color: rgba(255, 255, 255, 0.42);
+      font-size: 12px;
+      pointer-events: none;
+    }
+    .controls {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 8px;
+      z-index: 10;
+      width: max-content;
+      max-width: 96vw;
+    }
+    .btn {
+      background: rgba(255, 255, 255, 0.09);
+      color: rgba(255, 240, 244, 0.94);
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      padding: 8px 14px;
+      border-radius: 20px;
+      font-size: 12.5px;
+      font-family: monospace;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .btn:active { background: rgba(255, 255, 255, 0.24); }
+  </style>
+</head>
+<body>
+  <div class="hint">Góc nghiêng 45° • Xoay 360° (Vuốt màn hình để soi mọi góc)</div>
+  <canvas id="c"></canvas>
+  <div class="controls">
+    <button class="btn" id="btnColor">Màu: Đỏ nhung</button>
+    <button class="btn" id="btnReset">Góc 45°</button>
+    <button class="btn" id="btnPause">Tạm dừng</button>
+  </div>
+
+<script>
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const btnColor = document.getElementById("btnColor");
+  const btnPause = document.getElementById("btnPause");
+
+  // Bảng ký tự ASCII trải đều sắc độ từ tối đến sáng rực
+  const CHARS = " .,:;-=+*x#%@";
+  const TILT_45 = Math.PI / 4;
+
+  // 7 bảng màu với 4 tầng sắc độ (bóng sâu -> đậm -> tươi -> sáng nổi khối) + màu đáy cánh
+  const PALETTES = [
+    {
+      name: "Đỏ nhung",
+      s0: [72, 6, 26],     // bóng rượu vang sâu
+      s1: [168, 14, 42],   // đỏ thẫm
+      s2: [242, 46, 74],   // đỏ tươi nổi bật
+      s3: [255, 178, 192], // ánh sáng viền
+      heart: [255, 210, 58]
+    },
+    {
+      name: "Hồng đào",
+      s0: [88, 18, 52],
+      s1: [188, 56, 118],
+      s2: [252, 122, 176],
+      s3: [255, 224, 238],
+      heart: [255, 238, 160]
+    },
+    {
+      name: "Vàng kim",
+      s0: [108, 48, 4],
+      s1: [204, 126, 10],
+      s2: [255, 206, 28],
+      s3: [255, 252, 188],
+      heart: [180, 62, 12]
+    },
+    {
+      name: "Tím mộng mơ",
+      s0: [48, 14, 88],
+      s1: [116, 42, 198],
+      s2: [186, 104, 255],
+      s3: [242, 212, 255],
+      heart: [255, 235, 165]
+    },
+    {
+      name: "Cam san hô",
+      s0: [98, 22, 10],
+      s1: [202, 64, 18],
+      s2: [255, 128, 48],
+      s3: [255, 224, 152],
+      heart: [255, 232, 72]
+    },
+    {
+      name: "Xanh băng",
+      s0: [14, 42, 92],
+      s1: [32, 106, 204],
+      s2: [78, 184, 255],
+      s3: [215, 245, 255],
+      heart: [245, 252, 255]
+    },
+    {
+      name: "Trắng ngọc",
+      s0: [62, 72, 92],
+      s1: [136, 150, 172],
+      s2: [218, 226, 238],
+      s3: [255, 255, 255],
+      heart: [255, 236, 130]
+    }
+  ];
+  let paletteIdx = 0;
+
+  // Mật độ lưới bề mặt cao giúp cánh hoa kín mịn, không rỗ
+  const NU = 48, NV = 34;
+  const MAX_GRID = NU * NV;
+  const gxBuf = new Float32Array(MAX_GRID);
+  const gyBuf = new Float32Array(MAX_GRID);
+  const gzBuf = new Float32Array(MAX_GRID);
+
+  let W, H, CELL_W, CELL_H, COLS, ROWS;
+  let zBuf, charBuf, rBuf, gBuf, bBuf;
+
+  let rotY = 0.4;
+  let rotX = TILT_45;
+  let autoRotate = true;
+  let isDragging = false;
+  let lastPtrX = 0, lastPtrY = 0;
+  let lastNow = performance.now();
+
+  // Hệ thống 3 nguồn sáng 3D (đèn chính tạo khối, đèn phụ làm rõ bóng tối, đèn viền)
+  const L1 = normalize(0.58, 0.72, 0.68);
+  const H1 = normalize(L1[0], L1[1], L1[2] + 1.0); // Half-vector cho độ bóng Blinn-Phong
+  const L2 = normalize(-0.78, -0.10, 0.38);
+  const L3 = normalize(-0.35, 0.58, -0.82);
+
+  function normalize(x, y, z) {
+    const l = Math.hypot(x, y, z) || 1;
+    return [x / l, y / l, z / l];
+  }
+
+  const clamp = (v) => (v < 0 ? 0 : v > 255 ? 255 : v | 0);
+
+  function samplePalette(pal, t) {
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    let a, b, f;
+    if (t < 0.34) {
+      a = pal.s0; b = pal.s1; f = t / 0.34;
+    } else if (t < 0.72) {
+      a = pal.s1; b = pal.s2; f = (t - 0.34) / 0.38;
+    } else {
+      a = pal.s2; b = pal.s3; f = (t - 0.72) / 0.28;
+    }
+    return [
+      a[0] + (b[0] - a[0]) * f,
+      a[1] + (b[1] - a[1]) * f,
+      a[2] + (b[2] - a[2]) * f
+    ];
+  }
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Lưới ASCII mịn hơn để nét cánh hoa sắc và rõ khối
+    const fontSize = Math.max(8, Math.floor(Math.min(W, H) / 48));
+    CELL_H = fontSize;
+    CELL_W = Math.max(5, Math.round(fontSize * 0.6));
+    COLS = Math.floor(W / CELL_W);
+    ROWS = Math.floor(H / CELL_H);
+
+    const total = COLS * ROWS;
+    zBuf = new Float32Array(total);
+    charBuf = new Int16Array(total);
+    rBuf = new Uint8Array(total);
+    gBuf = new Uint8Array(total);
+    bBuf = new Uint8Array(total);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  let cosY, sinY, cosX, sinX, fov, camDist, centerX, centerY;
+
+  // baseType: 0 = cánh tulip, 1 = cành/lá, 2 = nhụy cái, 3 = bao phấn nhị đực
+  function plot3D(x, y, z, nx, ny, nz, baseType, ao, uNorm, vSigned, isOuterPetal) {
+    y -= 0.04;
+
+    // Xoay 360° quanh trục Y
+    const x1 = x * cosY + z * sinY;
+    const z1 = -x * sinY + z * cosY;
+
+    // Nghiêng 45° quanh trục X
+    const y2 = y * cosX - z1 * sinX;
+    const z2 = y * sinX + z1 * cosX;
+
+    const denom = camDist - z2;
+    if (denom < 0.6) return;
+
+    const proj = fov / denom;
+    const sx = Math.round((centerX + x1 * proj) / CELL_W);
+    const sy = Math.round((centerY - y2 * proj) / CELL_H);
+
+    if (sx < 0 || sx >= COLS || sy < 0 || sy >= ROWS) return;
+    const idx = sy * COLS + sx;
+    if (z2 <= zBuf[idx]) return;
+
+    // Xoay vector pháp tuyến theo góc nhìn
+    const nx1 = nx * cosY + nz * sinY;
+    const nz1 = -nx * sinY + nz * cosY;
+    let ny2 = ny * cosX - nz1 * sinX;
+    let nz2 = ny * sinX + nz1 * cosX;
+    let nx2 = nx1;
+
+    // Phân biệt mặt trong và mặt ngoài của cánh tulip để tạo chiều sâu lòng cốc
+    const isInnerFace = (baseType === 0 && nz2 < 0);
+    if (nz2 < 0) {
+      nx2 = -nx2; ny2 = -ny2; nz2 = -nz2;
+    }
+
+    const diff1 = Math.max(0, nx2 * L1[0] + ny2 * L1[1] + nz2 * L1[2]);
+    const diff2 = Math.max(0, nx2 * L2[0] + ny2 * L2[1] + nz2 * L2[2]);
+    const diff3 = Math.max(0, nx2 * L3[0] + ny2 * L3[1] + nz2 * L3[2]);
+
+    // Ánh sáng bóng lụa (Specular) tạo độ cong 3D nổi bật khi xoay
+    const ndh = Math.max(0, nx2 * H1[0] + ny2 * H1[1] + nz2 * H1[2]);
+    const spec = Math.pow(ndh, baseType === 0 ? (isInnerFace ? 14 : 20) : 16);
+
+    // Viền sáng khối (Fresnel Rim)
+    const rim = Math.pow(1 - Math.min(1, nz2), 2.3);
+    const depthCue = 0.74 + 0.26 * Math.max(0, Math.min(1, (z2 + 1.5) / 3.0));
+
+    let lum, cr, cg, cb;
+
+    if (baseType === 0) {
+      const pal = PALETTES[paletteIdx];
+      const absV = Math.abs(vSigned);
+
+      // Tạo vân gân cánh dọc mảnh + nhấn rãnh tối ở 2 mép cánh để tách rõ 6 cánh
+      const vein = 0.04 * Math.cos(vSigned * 15.0) * Math.sin(Math.PI * uNorm);
+      const edgeCrease = absV > 0.72 ? 1.0 - 0.36 * ((absV - 0.72) / 0.28) : 1.0;
+      const topLip = uNorm > 0.90 ? 0.22 * ((uNorm - 0.90) / 0.10) : 0.0;
+
+      if (isInnerFace) {
+        // Lòng trong cánh: đáy tối sâu tạo hốc 3D, sáng dần lên miệng cốc
+        const cupDepth = 0.26 + 0.74 * Math.pow(uNorm, 0.75);
+        lum = (cupDepth * (0.14 + 0.62 * diff1 + 0.20 * diff2) + 0.12 * spec + topLip + vein) * edgeCrease;
+      } else {
+        // Mặt ngoài cánh: sáng rõ, tương phản mạnh giữa vùng tối và vùng đón sáng
+        const outerBoost = isOuterPetal ? 1.05 : 0.92;
+        lum = (ao * (0.16 + 0.78 * diff1 + 0.18 * diff2 + 0.14 * diff3) + 0.28 * rim + topLip + vein) * edgeCrease * outerBoost;
+      }
+
+      lum = Math.max(0.05, Math.min(1.0, lum * depthCue));
+      const col = samplePalette(pal, lum);
+      cr = col[0]; cg = col[1]; cb = col[2];
+
+      // Pha sắc vàng/ấm ở đáy lòng hoa
+      if (uNorm < 0.28) {
+        const mix = (1 - uNorm / 0.28) * (isInnerFace ? 0.68 : 0.32);
+        const hLum = 0.35 + 0.65 * lum;
+        cr = cr * (1 - mix) + pal.heart[0] * hLum * mix;
+        cg = cg * (1 - mix) + pal.heart[1] * hLum * mix;
+        cb = cb * (1 - mix) + pal.heart[2] * hLum * mix;
+      }
+
+      // Cộng thêm ánh sáng bóng lụa trắng dịu lên đỉnh cong cánh hoa
+      const specStrength = isInnerFace ? 70 : 155;
+      cr += spec * specStrength;
+      cg += spec * specStrength * 0.94;
+      cb += spec * specStrength * 0.96;
+      lum = Math.min(1.0, lum + spec * (isInnerFace ? 0.18 : 0.38));
+
+    } else if (baseType === 1) {
+      // Cành & lá xanh có sắc độ đậm - sáng - ánh ngọc rõ rệt
+      lum = (ao * (0.20 + 0.76 * diff1 + 0.20 * diff2) + 0.22 * rim + 0.24 * spec) * depthCue;
+      lum = Math.max(0.08, Math.min(1.0, lum));
+      cr = 12 + 78 * Math.pow(lum, 1.35) + spec * 55;
+      cg = 46 + 185 * Math.pow(lum, 0.85) + spec * 65;
+      cb = 26 + 82 * Math.pow(lum, 1.15) + spec * 45;
+
+    } else if (baseType === 2) {
+      // Nhụy cái vàng chanh sáng giữa tâm
+      lum = Math.max(0.18, Math.min(1.0, (0.30 + 0.68 * diff1 + 0.22 * spec) * depthCue));
+      cr = 145 + 110 * lum;
+      cg = 165 + 88 * lum;
+      cb = 38 + 85 * lum;
+
+    } else {
+      // 6 bao phấn vàng cam đậm nổi bật trong lòng cốc hoa
+      lum = Math.max(0.20, Math.min(1.0, (0.28 + 0.72 * diff1 + 0.30 * spec) * depthCue));
+      cr = 148 + 107 * lum;
+      cg = 82 + 125 * lum;
+      cb = 12 + 45 * lum;
+    }
+
+    zBuf[idx] = z2;
+    // Giữ tối thiểu ký tự mức 2 để vùng bóng tối vẫn liền khối, không bị mất nét
+    const charIdx = Math.min(CHARS.length - 1, Math.max(2, Math.round(2 + lum * (CHARS.length - 3))));
+    charBuf[idx] = charIdx;
+    rBuf[idx] = clamp(cr);
+    gBuf[idx] = clamp(cg);
+    bBuf[idx] = clamp(cb);
+  }
+
+  function renderSurface(nu, nv, baseType, isOuterPetal, aoFn) {
+    for (let iu = 0; iu < nu; iu++) {
+      const iu0 = iu > 0 ? iu - 1 : iu;
+      const iu1 = iu < nu - 1 ? iu + 1 : iu;
+      const uNorm = iu / (nu - 1);
+
+      for (let iv = 0; iv < nv; iv++) {
+        const iv0 = iv > 0 ? iv - 1 : iv;
+        const iv1 = iv < nv - 1 ? iv + 1 : iv;
+        const vSigned = (iv / (nv - 1)) * 2 - 1;
+
+        const i = iu * nv + iv;
+        const iU0 = iu0 * nv + iv, iU1 = iu1 * nv + iv;
+        const iV0 = iu * nv + iv0, iV1 = iu * nv + iv1;
+
+        const tux = gxBuf[iU1] - gxBuf[iU0];
+        const tuy = gyBuf[iU1] - gyBuf[iU0];
+        const tuz = gzBuf[iU1] - gzBuf[iU0];
+
+        const tvx = gxBuf[iV1] - gxBuf[iV0];
+        const tvy = gyBuf[iV1] - gyBuf[iV0];
+        const tvz = gzBuf[iV1] - gzBuf[iV0];
+
+        let nx = tuy * tvz - tuz * tvy;
+        let ny = tuz * tvx - tux * tvz;
+        let nz = tux * tvy - tuy * tvx;
+        const len = Math.hypot(nx, ny, nz);
+        if (len > 1e-6) {
+          nx /= len; ny /= len; nz /= len;
+        } else {
+          nx = 0; ny = 1; nz = 0;
+        }
+
+        const ao = aoFn(uNorm, vSigned);
+        plot3D(gxBuf[i], gyBuf[i], gzBuf[i], nx, ny, nz, baseType, ao, uNorm, vSigned, isOuterPetal);
+      }
+    }
+  }
+
+  function renderTulip3D() {
+    // 1. 6 cánh tulip cố định ở dáng cốc nở đẹp nhất (3 cánh trong + 3 cánh ngoài xen kẽ 60°)
+    for (let k = 0; k < 6; k++) {
+      const isOuter = k >= 3;
+      const idxInWhorl = k % 3;
+      const baseAngle = idxInWhorl * ((Math.PI * 2) / 3) + (isOuter ? Math.PI / 3 : 0);
+
+      const rOffset = isOuter ? 0.085 : 0.0;
+      const flare = isOuter ? 0.24 : 0.11;
+
+      for (let iu = 0; iu < NU; iu++) {
+        const u = iu / (NU - 1);
+        // Dáng cánh bầu rộng ở thân, thuôn mềm ở đầu cánh
+        const profile = Math.pow(Math.sin(Math.PI * Math.pow(u, 0.72)), 0.65);
+
+        // Đường cong bầu cốc đặc trưng của hoa tulip
+        const rSpine = 0.08 + 0.49 * Math.sin(Math.PI * 0.72 * Math.pow(u, 0.70)) + flare * Math.pow(u, 1.9) + rOffset;
+        const ySpine = 1.28 * Math.pow(u, 0.84) - 0.09 * flare * Math.pow(u, 2.3);
+        const angHalfWidth = (isOuter ? 0.66 : 0.62) * profile;
+
+        for (let iv = 0; iv < NV; iv++) {
+          const v = (iv / (NV - 1)) * 2 - 1;
+          const theta = baseAngle + v * angHalfWidth;
+
+          // Độ phồng cong lòng thìa rõ rệt để bắt sáng 3D tách riêng từng cánh
+          const cupBulge = 0.135 * (1 - v * v) * Math.sin(Math.PI * u);
+          const keel = 0.022 * (1 - Math.abs(v)) * Math.sin(Math.PI * u);
+          const tipCurl = 0.042 * (1 - v * v) * Math.pow(u, 3.0) * (isOuter ? 1.2 : 0.7);
+
+          const R = Math.max(0.01, rSpine + cupBulge + keel + tipCurl);
+          const Y = ySpine - 0.032 * v * v * profile;
+
+          const idx = iu * NV + iv;
+          gxBuf[idx] = R * Math.cos(theta);
+          gyBuf[idx] = Y;
+          gzBuf[idx] = R * Math.sin(theta);
+        }
+      }
+
+      renderSurface(NU, NV, 0, isOuter, (u, v) => {
+        const belly = 0.88 + 0.12 * (1 - v * v);
+        return (0.42 + 0.58 * Math.pow(u, 0.55)) * belly;
+      });
+    }
+
+    // 2. Nhụy cái ở giữa lòng hoa
+    const pU = 14, pV = 12;
+    for (let iu = 0; iu < pU; iu++) {
+      const u = iu / (pU - 1);
+      const y = 0.04 + u * 0.50;
+      const baseR = 0.056 - 0.014 * u + 0.032 * Math.pow(u, 5);
+      for (let iv = 0; iv < pV; iv++) {
+        const th = (iv / (pV - 1)) * Math.PI * 2;
+        const lobe = 1 + 0.26 * Math.pow(u, 4) * Math.cos(3 * th);
+        const r = baseR * lobe;
+        const idx = iu * pV + iv;
+        gxBuf[idx] = r * Math.cos(th);
+        gyBuf[idx] = y;
+        gzBuf[idx] = r * Math.sin(th);
+      }
+    }
+    renderSurface(pU, pV, 2, false, (u) => 0.65 + 0.35 * u);
+
+    // 3. 6 nhị đực xếp vòng đều trong lòng hoa
+    const sU = 10, sV = 8;
+    const aU = 12, aV = 10;
+    for (let s = 0; s < 6; s++) {
+      const sa = s * (Math.PI / 3) + Math.PI / 6;
+      const spread = 0.16;
+      const topX = spread * Math.cos(sa);
+      const topZ = spread * Math.sin(sa);
+      const topY = 0.36;
+
+      for (let iu = 0; iu < sU; iu++) {
+        const u = iu / (sU - 1);
+        const rr = 0.045 + (spread - 0.045) * Math.pow(u, 0.8);
+        const cx = rr * Math.cos(sa);
+        const cz = rr * Math.sin(sa);
+        const cy = 0.04 + u * 0.32;
+        const r = 0.017;
+        for (let iv = 0; iv < sV; iv++) {
+          const th = (iv / (sV - 1)) * Math.PI * 2;
+          const idx = iu * sV + iv;
+          gxBuf[idx] = cx + r * Math.cos(th);
+          gyBuf[idx] = cy;
+          gzBuf[idx] = cz + r * Math.sin(th);
+        }
+      }
+      renderSurface(sU, sV, 2, false, (u) => 0.60 + 0.35 * u);
+
+      for (let iu = 0; iu < aU; iu++) {
+        const u = iu / (aU - 1);
+        const r = 0.036 * Math.sin(Math.PI * u);
+        const cy = topY + u * 0.21;
+        const lean = u * 0.04;
+        const cx = topX + lean * Math.cos(sa);
+        const cz = topZ + lean * Math.sin(sa);
+        for (let iv = 0; iv < aV; iv++) {
+          const th = (iv / (aV - 1)) * Math.PI * 2;
+          const idx = iu * aV + iv;
+          gxBuf[idx] = cx + r * Math.cos(th);
+          gyBuf[idx] = cy;
+          gzBuf[idx] = cz + r * Math.sin(th);
+        }
+      }
+      renderSurface(aU, aV, 3, false, (u) => 0.68 + 0.32 * u);
+    }
+
+    // 4. Cành tulip chắc khỏe
+    const stU = 28, stV = 14;
+    for (let iu = 0; iu < stU; iu++) {
+      const u = iu / (stU - 1);
+      const y = 0.03 - u * 1.28;
+      const cx = 0.032 * Math.sin(u * 2.5);
+      const cz = 0.022 * Math.cos(u * 2.1) - 0.022;
+      const r = 0.066 - 0.008 * u;
+      for (let iv = 0; iv < stV; iv++) {
+        const th = (iv / (stV - 1)) * Math.PI * 2;
+        const idx = iu * stV + iv;
+        gxBuf[idx] = cx + r * Math.cos(th);
+        gyBuf[idx] = y;
+        gzBuf[idx] = cz + r * Math.sin(th);
+      }
+    }
+    renderSurface(stU, stV, 1, false, () => 0.85);
+
+    // 5. Hai lá tulip dài bản rộng uốn ôm thân
+    const leaves = [
+      { ang: 0.35, yBase: -1.10, h: 1.38, reach: 0.90, width: 0.26 },
+      { ang: 3.45, yBase: -1.18, h: 1.24, reach: 0.82, width: 0.24 },
+    ];
+    const lfU = 34, lfV = 18;
+    for (const lf of leaves) {
+      const ca = Math.cos(lf.ang), sa = Math.sin(lf.ang);
+      for (let iu = 0; iu < lfU; iu++) {
+        const u = iu / (lfU - 1);
+        const widthProfile = Math.sin(Math.PI * Math.pow(u, 0.72));
+        const halfW = lf.width * widthProfile;
+
+        const rCenter = 0.068 + lf.reach * Math.pow(u, 1.32);
+        const yCenter = lf.yBase + lf.h * Math.pow(u, 0.82) - 0.28 * Math.pow(u, 2.8);
+
+        for (let iv = 0; iv < lfV; iv++) {
+          const v = (iv / (lfV - 1)) * 2 - 1;
+          const wave = 0.020 * Math.sin(u * 7.5) * v * v;
+          const lx = rCenter - 0.075 * v * v * widthProfile;
+          const lz = v * halfW;
+          const ly = yCenter + 0.055 * Math.abs(v) * widthProfile + wave;
+
+          const idx = iu * lfV + iv;
+          gxBuf[idx] = lx * ca - lz * sa;
+          gyBuf[idx] = ly;
+          gzBuf[idx] = lx * sa + lz * ca;
+        }
+      }
+      renderSurface(lfU, lfV, 1, false, (u, v) => {
+        const midRib = Math.abs(v) < 0.14 ? 0.16 : 0;
+        return 0.58 + 0.34 * u + midRib;
+      });
+    }
+  }
+
+  function loop(now) {
+    const dt = Math.min(0.05, (now - lastNow) / 1000);
+    lastNow = now;
+
+    if (autoRotate && !isDragging) {
+      rotY += dt * 0.75; // Xoay tròn 360° liên tục
+    }
+
+    zBuf.fill(-1e9);
+    charBuf.fill(0);
+
+    cosY = Math.cos(rotY);
+    sinY = Math.sin(rotY);
+    cosX = Math.cos(rotX);
+    sinX = Math.sin(rotX);
+    fov = Math.min(W, H) * 1.28;
+    camDist = 4.25;
+    centerX = W * 0.5;
+    centerY = H * 0.5;
+
+    renderTulip3D();
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+    ctx.font = `bold ${CELL_H}px monospace`;
+    ctx.textBaseline = "top";
+
+    for (let gy = 0; gy < ROWS; gy++) {
+      const rowOff = gy * COLS;
+      const py = gy * CELL_H;
+      for (let gx = 0; gx < COLS; gx++) {
+        const idx = rowOff + gx;
+        const ci = charBuf[idx];
+        if (ci > 0) {
+          ctx.fillStyle = `rgb(${rBuf[idx]},${gBuf[idx]},${bBuf[idx]})`;
+          ctx.fillText(CHARS[ci], gx * CELL_W, py);
+        }
+      }
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  // Vuốt màn hình để xoay tự do mọi góc
+  canvas.addEventListener("pointerdown", (e) => {
+    isDragging = true;
+    lastPtrX = e.clientX;
+    lastPtrY = e.clientY;
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (!isDragging) return;
+    const dx = e.clientX - lastPtrX;
+    const dy = e.clientY - lastPtrY;
+    lastPtrX = e.clientX;
+    lastPtrY = e.clientY;
+    rotY += dx * 0.009;
+    rotX = Math.max(-1.25, Math.min(1.4, rotX + dy * 0.009));
+  });
+  canvas.addEventListener("pointerup", () => { isDragging = false; });
+  canvas.addEventListener("pointercancel", () => { isDragging = false; });
+
+  // Nút điều khiển
+  btnColor.addEventListener("click", () => {
+    paletteIdx = (paletteIdx + 1) % PALETTES.length;
+    btnColor.textContent = "Màu: " + PALETTES[paletteIdx].name;
+  });
+
+  document.getElementById("btnReset").addEventListener("click", () => {
+    rotX = TILT_45;
+  });
+
+  btnPause.addEventListener("click", () => {
+    autoRotate = !autoRotate;
+    btnPause.textContent = autoRotate ? "Tạm dừng" : "Tiếp tục xoay";
+  });
+
+  requestAnimationFrame(loop);
+</script>
+</body>
+</html>
